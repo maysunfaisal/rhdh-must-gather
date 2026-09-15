@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	chartv2 "helm.sh/helm/v4/pkg/chart/v2"
 	"helm.sh/helm/v4/pkg/release"
@@ -97,13 +100,19 @@ metadata:
   name: backstage-rhdh
 ---
 apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backstage-rhdh-ia-okp
+---
+apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: backstage-psql-rhdh
 `
-	deploy, sts := extractWorkloadNames(manifest)
-	if deploy != "backstage-rhdh" {
-		t.Errorf("deploy = %q, want backstage-rhdh", deploy)
+	deployments, sts := extractWorkloadNames(manifest)
+	wantDeployments := []string{"backstage-rhdh", "backstage-rhdh-ia-okp"}
+	if !reflect.DeepEqual(deployments, wantDeployments) {
+		t.Errorf("deployments = %q, want %q", deployments, wantDeployments)
 	}
 	if sts != "backstage-psql-rhdh" {
 		t.Errorf("sts = %q, want backstage-psql-rhdh", sts)
@@ -116,12 +125,87 @@ kind: Service
 metadata:
   name: my-service
 `
-	deploy, sts := extractWorkloadNames(manifest)
-	if deploy != "" {
-		t.Errorf("deploy = %q, want empty", deploy)
+	deployments, sts := extractWorkloadNames(manifest)
+	if len(deployments) != 0 {
+		t.Errorf("deployments = %q, want empty", deployments)
 	}
 	if sts != "" {
 		t.Errorf("sts = %q, want empty", sts)
+	}
+}
+
+func TestDeploymentHasContainer(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "rhdh"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "backstage-backend"},
+						{Name: "lightspeed-core"},
+					},
+				},
+			},
+		},
+	}
+
+	if !deploymentHasContainer(dep, "backstage-backend") {
+		t.Error("expected backstage-backend container to identify the RHDH Deployment")
+	}
+	if deploymentHasContainer(dep, "okp") {
+		t.Error("did not expect an OKP container in the RHDH Deployment")
+	}
+}
+
+func TestSelectPrimaryDeployment(t *testing.T) {
+	deployment := func(name string, containers ...string) *appsv1.Deployment {
+		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		for _, container := range containers {
+			dep.Spec.Template.Spec.Containers = append(dep.Spec.Template.Spec.Containers, corev1.Container{Name: container})
+		}
+		return dep
+	}
+
+	tests := []struct {
+		name        string
+		deployments []*appsv1.Deployment
+		want        string
+	}{
+		{
+			name: "multiple primary candidates use the first name",
+			deployments: []*appsv1.Deployment{
+				deployment("z-rhdh", "backstage-backend"),
+				deployment("okp", "okp"),
+				deployment("a-rhdh", "backstage-backend"),
+			},
+			want: "a-rhdh",
+		},
+		{
+			name: "first name is the fallback when no candidate matches",
+			deployments: []*appsv1.Deployment{
+				deployment("z-dependency", "worker"),
+				deployment("a-dependency", "okp"),
+			},
+			want: "a-dependency",
+		},
+		{
+			name: "empty list has no primary",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := selectPrimaryDeployment(tt.deployments)
+			if got == nil {
+				if tt.want != "" {
+					t.Fatalf("selectPrimaryDeployment() = nil, want %q", tt.want)
+				}
+				return
+			}
+			if got.Name != tt.want {
+				t.Errorf("selectPrimaryDeployment() = %q, want %q", got.Name, tt.want)
+			}
+		})
 	}
 }
 

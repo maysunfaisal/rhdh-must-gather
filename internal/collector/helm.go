@@ -201,14 +201,46 @@ func (h *Helm) collectReleaseData(ctx context.Context, cfg *Config, ns, name, re
 		notes := relAcc.Notes()
 		_ = os.WriteFile(filepath.Join(releaseDir, "notes.txt"), []byte(notes), 0o644)
 
-		// Extract workload names from manifest for collection
-		deployName, stsName := extractWorkloadNames(manifest)
-		if deployName != "" {
-			ref := WorkloadRef{Namespace: ns, Name: deployName, Kind: KindDeployment, InstanceName: name}
-			if err := CollectWorkload(ctx, cfg, ref, filepath.Join(releaseDir, "deployment")); err != nil {
-				log.Warn("Failed to collect workload %s/%s: %v", ns, deployName, err)
+		// Collect every Deployment rendered by the release. The Deployment
+		// containing backstage-backend is the primary RHDH workload; all others
+		// are release dependencies such as Intelligent Assistant's OKP.
+		deployNames, stsName := extractWorkloadNames(manifest)
+		deployments := make([]*appsv1.Deployment, 0, len(deployNames))
+		for _, deployName := range deployNames {
+			dep, err := cfg.Client.Clientset.AppsV1().Deployments(ns).Get(ctx, deployName, metav1.GetOptions{})
+			if err != nil {
+				log.Warn("Failed to get deployment %s/%s: %v", ns, deployName, err)
+				continue
 			}
-			processedWorkloads[ns+"/"+deployName] = true
+			deployments = append(deployments, dep)
+		}
+
+		primary := selectPrimaryDeployment(deployments)
+		if primary != nil && !deploymentHasContainer(primary, backstageContainer) {
+			log.Warn("No Deployment with a %s container found; using %s as the primary workload", backstageContainer, primary.Name)
+		}
+
+		for _, dep := range deployments {
+			outDir := filepath.Join(releaseDir, "dependencies", dep.Name)
+			skipAppData := true
+			if dep == primary {
+				outDir = filepath.Join(releaseDir, "deployment")
+				skipAppData = false
+			} else {
+				log.Info("    --> Collecting Helm dependency Deployment: %s", dep.Name)
+			}
+
+			ref := WorkloadRef{
+				Namespace:    ns,
+				Name:         dep.Name,
+				Kind:         KindDeployment,
+				InstanceName: name,
+				SkipAppData:  skipAppData,
+			}
+			if err := CollectWorkload(ctx, cfg, ref, outDir); err != nil {
+				log.Warn("Failed to collect workload %s/%s: %v", ns, dep.Name, err)
+			}
+			processedWorkloads[ns+"/"+dep.Name] = true
 		}
 		if stsName != "" {
 			if err := CollectDBStatefulSet(ctx, cfg, ns, stsName, releaseDir); err != nil {
@@ -542,7 +574,7 @@ func isSecretDocument(node *yaml.Node) bool {
 	return false
 }
 
-func extractWorkloadNames(manifest string) (deployName, stsName string) {
+func extractWorkloadNames(manifest string) (deployNames []string, stsName string) {
 	decoder := yaml.NewDecoder(strings.NewReader(manifest))
 	for {
 		var doc struct {
@@ -556,8 +588,8 @@ func extractWorkloadNames(manifest string) (deployName, stsName string) {
 		}
 		switch doc.Kind {
 		case "Deployment":
-			if deployName == "" {
-				deployName = doc.Metadata.Name
+			if doc.Metadata.Name != "" {
+				deployNames = append(deployNames, doc.Metadata.Name)
 			}
 		case "StatefulSet":
 			if stsName == "" {
@@ -566,6 +598,34 @@ func extractWorkloadNames(manifest string) (deployName, stsName string) {
 		}
 	}
 	return
+}
+
+func deploymentHasContainer(dep *appsv1.Deployment, name string) bool {
+	for _, container := range dep.Spec.Template.Spec.Containers {
+		if container.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func selectPrimaryDeployment(deployments []*appsv1.Deployment) *appsv1.Deployment {
+	if len(deployments) == 0 {
+		return nil
+	}
+
+	sorted := append([]*appsv1.Deployment(nil), deployments...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	for _, dep := range sorted {
+		if deploymentHasContainer(dep, backstageContainer) {
+			return dep
+		}
+	}
+
+	return sorted[0]
 }
 
 func chartNameFromAccessor(acc release.Accessor) string {

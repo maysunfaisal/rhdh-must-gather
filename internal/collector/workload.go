@@ -29,6 +29,7 @@ type WorkloadRef struct {
 	Name         string
 	Kind         WorkloadKind
 	InstanceName string
+	SkipAppData  bool
 }
 
 func CollectWorkload(ctx context.Context, cfg *Config, ref WorkloadRef, outDir string) error {
@@ -103,7 +104,7 @@ func CollectWorkload(ctx context.Context, cfg *Config, ref WorkloadRef, outDir s
 			CollectPodLogs(ctx, cfg, ns, pod, filepath.Join(outDir, "logs", "pod="+pod.Name))
 		}()
 
-		if pod.Status.Phase == corev1.PodRunning {
+		if pod.Status.Phase == corev1.PodRunning && !ref.SkipAppData {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -118,7 +119,9 @@ func CollectWorkload(ctx context.Context, cfg *Config, ref WorkloadRef, outDir s
 	}
 	wg.Wait()
 
-	collectHeapDumps(cfg, ns, labelSelector, outDir, ref.Name, ref.InstanceName, string(ref.Kind))
+	if !ref.SkipAppData {
+		collectHeapDumps(cfg, ns, labelSelector, outDir, ref.Name, ref.InstanceName, string(ref.Kind))
+	}
 
 	return nil
 }
